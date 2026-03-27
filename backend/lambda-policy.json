@@ -1,4 +1,4 @@
-{
+$content = '{
   "Version": "2012-10-17",
   "Statement": [
     {
@@ -6,7 +6,7 @@
       "Action": ["bedrock:InvokeModel"],
       "Resource": [
         "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0",
-        "arn:aws:bedrock:*:595319716292:inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+        "arn:aws:bedrock:*:YOUR_ACCOUNT_ID:inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
       ]
     },
     {
@@ -15,4 +15,5 @@
       "Resource": "arn:aws:dynamodb:us-east-1:*:table/threat-intel-chat-history"
     }
   ]
-}
+}'
+[System.IO.File]::WriteAllText("$PWD\backend\lambda-policy.json", $content, [System.Text.UTF8Encoding]::new($false))
