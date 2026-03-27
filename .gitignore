@@ -1,0 +1,21 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# React
+frontend/node_modules/
+frontend/build/
+
+# AWS
+*.json.backup
+response.json
+response_test.json
+frontend/bucket-policy.json
+frontend/cf-config.json
+frontend/oac.json
+frontend/s3-cf-policy.json
+request.json
+api-test-body.json
+test-event.json
