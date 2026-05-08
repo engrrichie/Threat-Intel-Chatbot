@@ -1,0 +1,219 @@
+import boto3
+import json
+from botocore.config import Config
+from opensearchpy import OpenSearch, RequestsHttpConnection
+from requests_aws4auth import AWS4Auth
+
+ENDPOINT       = "https://fksct3ytygbgih1qxdw0.us-east-1.aoss.amazonaws.com"
+INDEX          = "cve-index"
+REGION         = "us-east-1"
+EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"
+CLAUDE_MODEL   = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+bedrock = boto3.client(
+    "bedrock-runtime",
+    region_name=REGION,
+    config=Config(
+        retries={"max_attempts": 3, "mode": "adaptive"},
+        connect_timeout=10,
+        read_timeout=60
+    )
+)
+
+SYSTEM_PROMPT = """You are a Tier-2 SOC analyst assistant specialising in CVE 
+threat intelligence. You answer questions using ONLY the CVE documents provided 
+to you. 
+
+Rules:
+1. Always state confidence: [HIGH], [MEDIUM], or [LOW]
+2. Always cite the CVE ID when referencing a specific vulnerability
+3. Structure answers as: Summary | CVEs Found | Recommended Actions
+4. If the answer is not in the provided documents, say exactly: 
+   "This information was not found in the current CVE knowledge base."
+5. Never invent CVE IDs or CVSS scores"""
+
+
+def get_opensearch_client():
+    credentials = boto3.Session().get_credentials().get_frozen_credentials()
+    awsauth = AWS4Auth(
+        credentials.access_key,
+        credentials.secret_key,
+        REGION,
+        "aoss",
+        session_token=credentials.token
+    )
+    return OpenSearch(
+        hosts=[{"host": ENDPOINT.replace("https://", ""), "port": 443}],
+        http_auth=awsauth,
+        use_ssl=True,
+        verify_certs=True,
+        connection_class=RequestsHttpConnection,
+        timeout=30
+    )
+
+
+def embed_question(question):
+    """Convert the user question into a vector."""
+    response = bedrock.invoke_model(
+        modelId=EMBED_MODEL_ID,
+        body=json.dumps({"inputText": question[:8000]})
+    )
+    result = json.loads(response["body"].read())
+    return result["embedding"]
+
+
+def search_cves(client, question_vector, question_text, top_k=5):
+    """
+    Hybrid search — combines semantic (kNN) and keyword (BM25) search.
+    kNN finds conceptually similar CVEs.
+    BM25 finds exact keyword matches like specific CVE IDs.
+    """
+    query = {
+        "size": top_k,
+        "_source": ["cve_id", "severity", "cvss_score", "description", "published", "chunk_text"],
+        "query": {
+            "bool": {
+                "should": [
+                    # Semantic search — finds similar meaning
+                    {
+                        "knn": {
+                            "embedding": {
+                                "vector": question_vector,
+                                "k": top_k
+                            }
+                        }
+                    },
+                    # Keyword search — finds exact matches
+                    {
+                        "multi_match": {
+                            "query": question_text,
+                            "fields": ["description^2", "chunk_text", "cve_id^3"],
+                            "type": "best_fields"
+                        }
+                    }
+                ],
+                # Only return CVEs that have a CVSS score (filter out rejected ones)
+                "filter": [
+                    {"exists": {"field": "cvss_score"}}
+                ]
+            }
+        }
+    }
+    response = client.search(index=INDEX, body=query)
+    return response["hits"]["hits"]
+
+
+def build_context(hits):
+    """Format the retrieved CVEs into a context block for Claude."""
+    if not hits:
+        return "No relevant CVEs found in the knowledge base."
+
+    context_parts = []
+    for i, hit in enumerate(hits, 1):
+        src = hit["_source"]
+        context_parts.append(
+            f"[CVE {i}]\n"
+            f"ID: {src.get('cve_id', 'Unknown')}\n"
+            f"Severity: {src.get('severity', 'Unknown')}\n"
+            f"CVSS Score: {src.get('cvss_score', 'Unknown')}\n"
+            f"Published: {src.get('published', 'Unknown')}\n"
+            f"Description: {src.get('description', 'No description')}\n"
+        )
+    return "\n---\n".join(context_parts)
+
+
+def generate_answer(question, context):
+    """Send the question + retrieved CVEs to Claude for a grounded answer."""
+    prompt = f"""Here are the relevant CVEs from our knowledge base:
+
+{context}
+
+---
+
+Based ONLY on the CVEs above, answer this question:
+{question}"""
+
+    response = bedrock.invoke_model(
+        modelId=CLAUDE_MODEL,
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1024,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}]
+        })
+    )
+    result = json.loads(response["body"].read())
+    return result["content"][0]["text"]
+
+
+def lambda_handler(event, context):
+    """Main entry point — API Gateway calls this for every chat message."""
+
+    if event.get("httpMethod") == "OPTIONS":
+        return cors_response(200, {})
+
+    try:
+        body         = json.loads(event.get("body", "{}"))
+        question     = body.get("message", "").strip()
+        session_id   = body.get("session_id", "default")
+
+        if not question:
+            return cors_response(400, {"error": "Message cannot be empty"})
+
+        print(f"Question: {question}")
+
+        # Step 1 — embed the question
+        question_vector = embed_question(question)
+        print("Question embedded")
+
+        # Step 2 — search OpenSearch for relevant CVEs
+        client = get_opensearch_client()
+        hits   = search_cves(client, question_vector, question)
+        print(f"Found {len(hits)} relevant CVEs")
+
+        # Step 3 — build context from retrieved CVEs
+        context = build_context(hits)
+
+        # Step 4 — generate grounded answer with Claude
+        answer = generate_answer(question, context)
+        print("Answer generated")
+
+        return cors_response(200, {
+            "reply":      answer,
+            "session_id": session_id,
+            "sources":    [h["_source"].get("cve_id") for h in hits]
+        })
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return cors_response(500, {"error": "Internal server error"})
+
+
+def cors_response(status_code, body):
+    return {
+        "statusCode": status_code,
+        "headers": {
+            "Content-Type":                 "application/json",
+            "Access-Control-Allow-Origin":  "*",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
+            "Access-Control-Allow-Methods": "POST,OPTIONS",
+        },
+        "body": json.dumps(body),
+    }
+
+
+if __name__ == "__main__":
+    # Local test
+    test_event = {
+        "httpMethod": "POST",
+        "body": json.dumps({
+            "session_id": "test-rag-1",
+            "message":    "What are the most critical remote code execution vulnerabilities?"
+        })
+    }
+    result = lambda_handler(test_event, None)
+    body   = json.loads(result["body"])
+    print("\n=== ANSWER ===")
+    print(body.get("reply", "No reply"))
+    print("\n=== SOURCES ===")
+    print(body.get("sources", []))
